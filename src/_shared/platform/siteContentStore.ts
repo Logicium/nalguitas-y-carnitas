@@ -8,7 +8,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import { contentClient } from './contentClient'
-import { PLATFORM_ENABLED, PLATFORM_SITE_KEY } from './config'
+import { PLATFORM_ENABLED, PLATFORM_SITE_KEY, PLATFORM_SITE_ID, PLATFORM_SLUG, DEMO_MODE } from './config'
 
 function deepMerge<T>(base: T, override: unknown): T {
   if (override === null || override === undefined) return base
@@ -34,6 +34,12 @@ export function applyDeep(target: Record<string, unknown>, source: unknown): voi
     const cur = target[k]
     if (v && typeof v === 'object' && !Array.isArray(v) && cur && typeof cur === 'object' && !Array.isArray(cur)) {
       applyDeep(cur as Record<string, unknown>, v)
+    } else if (v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(cur)) {
+      // Shape mismatch: the overlay has a plain object where the template
+      // expects an array (seen with legacy admin payloads, e.g. rooms as
+      // `{intro, items}`). Clobbering the array crashes template code that
+      // maps over it — keep the build-time array and skip the bad branch.
+      console.warn(`[content] ignoring overlay for "${k}": expected array, got object`)
     } else {
       target[k] = v
     }
@@ -42,6 +48,11 @@ export function applyDeep(target: Record<string, unknown>, source: unknown): voi
 
 export const useSiteContentStore = defineStore('siteContent', () => {
   const config = ref<unknown>(null)
+  // The reactive build-time siteConfig object every section actually reads.
+  // Unlike `config` (which hydrate() replaces with a merged snapshot), this
+  // reference is captured once and never swapped — so the live content editor
+  // can mutate it in place and have the page update instantly.
+  const liveConfig = ref<unknown>(null)
   const hydrated = ref(false)
   const hydrating = ref(false)
   const error = ref<string | null>(null)
@@ -50,10 +61,24 @@ export const useSiteContentStore = defineStore('siteContent', () => {
   const googleReviews = ref<Array<{ quote: string; author: string; source?: string; rating?: number }>>([])
   const googleReviewsLoaded = ref(false)
 
+  // Live Instagram feed, mapped to the GallerySection photo shape. When the
+  // owner has connected Instagram, this replaces the build-time gallery.
+  const instagramMedia = ref<Array<{ id: string; src: string; permalink: string; caption?: string }>>([])
+  let instagramLookup: Promise<void> | null = null
+
   // Cached id of the site whose slug matches PLATFORM_SITE_KEY — needed to call
   // the owner-scoped admin endpoints from the public site.
   const ownedSiteId = ref<string | null>(null)
   let ownedSiteLookup: Promise<string | null> | null = null
+
+  /** Add-ons enabled on this site (e.g. 'appointments'). Populated by hydrate(). */
+  const addOns = ref<string[]>([])
+  function hasAddOn(name: string): boolean {
+    // Demo templates showcase every premium add-on (against simulated data)
+    // so visitors experience what they'd be upgrading to.
+    if (DEMO_MODE) return true
+    return addOns.value.includes(name)
+  }
 
   const isPlatform = computed(() => PLATFORM_ENABLED && !!PLATFORM_SITE_KEY)
 
@@ -66,20 +91,45 @@ export const useSiteContentStore = defineStore('siteContent', () => {
   // Templates seed the initial value with their build-time siteConfig.
   function setBuildTimeConfig(cfg: unknown) {
     if (config.value === null) config.value = cfg
+    // Capture the reactive object once; hydrate() never replaces this one.
+    if (liveConfig.value === null) liveConfig.value = cfg
   }
 
   async function loadGoogleReviews() {
-    if (!isPlatform.value || googleReviewsLoaded.value) return
+    if (!isPlatform.value) return
     try {
       const list = await contentClient.fetchReviews()
-      googleReviews.value = list.map(r => ({
-        quote: r.text,
-        author: r.author,
-        source: r.source || 'Google',
-        rating: r.rating,
-      }))
+      // Public site only shows reviews that actually have substance: at least
+      // four stars and a non-empty body. Anything else feels like clutter.
+      googleReviews.value = list
+        .filter(r => (r.rating ?? 0) >= 4 && !!r.text && r.text.trim().length > 0)
+        .map(r => ({
+          quote: r.text,
+          author: r.author,
+          source: r.source || 'Google',
+          rating: r.rating,
+        }))
       googleReviewsLoaded.value = true
     } catch { /* ignore — testimonials remain the fallback */ }
+  }
+
+  /** Fetch the connected Instagram feed once; no-op on static/demo builds.
+      Safe to call from every GallerySection — concurrent calls coalesce. */
+  function loadInstagram(): Promise<void> {
+    if (!isPlatform.value) return Promise.resolve()
+    if (!instagramLookup) {
+      instagramLookup = contentClient.fetchInstagram()
+        .then(res => {
+          instagramMedia.value = res.media.map(m => ({
+            id: m.id,
+            src: m.media_url,
+            permalink: m.permalink,
+            caption: m.caption,
+          }))
+        })
+        .catch(() => { /* stock gallery remains the fallback */ })
+    }
+    return instagramLookup
   }
 
   async function hydrate() {
@@ -88,7 +138,9 @@ export const useSiteContentStore = defineStore('siteContent', () => {
     try {
       const res = await contentClient.fetchContent()
       config.value = deepMerge(config.value, res.content)
+      addOns.value = res.addOns ?? []
       hydrated.value = true
+      applyFavicon()
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
       // swallow — fall back to build-time config
@@ -97,23 +149,48 @@ export const useSiteContentStore = defineStore('siteContent', () => {
     }
   }
 
+  /**
+   * Swap the document's `<link rel="icon">` if the published config defines a
+   * custom favicon URL. Runs after hydrate so visitors always see the owner's
+   * latest tab icon without needing a per-template touch.
+   */
+  function applyFavicon() {
+    if (typeof document === 'undefined') return
+    const cfg = config.value as { favicon?: string; brand?: { favicon?: string } } | null
+    const url = cfg?.favicon || cfg?.brand?.favicon
+    if (!url) return
+    let link = document.querySelector<HTMLLinkElement>('link[rel~="icon"]')
+    if (!link) {
+      link = document.createElement('link')
+      link.rel = 'icon'
+      document.head.appendChild(link)
+    }
+    link.href = url
+  }
+
   // Whenever the public site is configured for Google reviews, fetch them once.
   watch(reviewsSource, (s) => {
     if (s === 'google') void loadGoogleReviews()
   }, { immediate: true })
 
   /**
-   * Look up the site row whose slug matches PLATFORM_SITE_KEY. Used by the
-   * public-site ThemeSwitcher to publish theme changes back to the owner's
-   * site without needing the admin layout / activeSiteStore.
+   * Resolve this deployment's site row id from the backend so the
+   * ThemeSwitcher can call the owner-scoped admin endpoints. We prefer the
+   * immutable UUID injected at build time (`PLATFORM_SITE_ID`) and fall back
+   * to a slug lookup for sites deployed before the ID switchover.
    */
   async function resolveOwnedSiteId(): Promise<string | null> {
     if (ownedSiteId.value) return ownedSiteId.value
     if (!isPlatform.value) return null
+    // Fast path: the provisioner injects the row's UUID directly, no list call.
+    if (PLATFORM_SITE_ID) {
+      ownedSiteId.value = PLATFORM_SITE_ID
+      return ownedSiteId.value
+    }
     if (!ownedSiteLookup) {
       ownedSiteLookup = contentClient.listSites()
         .then(sites => {
-          const match = sites.find(s => s.slug === PLATFORM_SITE_KEY)
+          const match = sites.find(s => s.id === PLATFORM_SITE_KEY || s.slug === PLATFORM_SITE_KEY || s.slug === PLATFORM_SLUG)
           ownedSiteId.value = match?.id ?? null
           return ownedSiteId.value
         })
@@ -130,7 +207,7 @@ export const useSiteContentStore = defineStore('siteContent', () => {
    */
   async function saveThemePatch(patch: Record<string, unknown>): Promise<void> {
     const id = await resolveOwnedSiteId()
-    if (!id) return
+    if (!id) throw new Error('Could not resolve site id for this deployment')
     const draft = await contentClient.getDraft(id).catch(() => null)
     const base = (draft?.payload ?? {}) as Record<string, unknown>
     const merged: Record<string, unknown> = { ...base }
@@ -146,9 +223,11 @@ export const useSiteContentStore = defineStore('siteContent', () => {
   }
 
   return {
-    config, hydrated, hydrating, error, isPlatform,
+    config, liveConfig, hydrated, hydrating, error, isPlatform,
     reviewsSource, googleReviews,
+    instagramMedia, loadInstagram,
     ownedSiteId,
+    addOns, hasAddOn,
     hydrate, setBuildTimeConfig, loadGoogleReviews,
     resolveOwnedSiteId, saveThemePatch,
   }
