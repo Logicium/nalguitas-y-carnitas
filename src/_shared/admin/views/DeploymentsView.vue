@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, ref, computed, watch } from 'vue'
 import { contentClient } from '../../platform/contentClient'
 import { useActiveSiteStore } from '../../platform/activeSiteStore'
 
@@ -17,6 +17,7 @@ const deployLoading = ref(false)
 const deployError = ref<string | null>(null)
 
 const sites = computed<Site[]>(() => activeSites.sites)
+const activeSite = computed<Site | null>(() => sites.value.find(s => s.id === selectedSiteId.value) ?? null)
 
 async function loadLogs(siteId: string) {
   if (!siteId) return
@@ -46,6 +47,9 @@ onMounted(async () => {
   const first = activeSites.activeId || sites.value[0]?.id
   if (first) await selectSite(first)
 })
+
+// Follow the header's site switcher.
+watch(() => activeSites.activeId, (id) => { if (id && id !== selectedSiteId.value) void selectSite(id) })
 </script>
 
 <template>
@@ -64,16 +68,15 @@ onMounted(async () => {
 
     <template v-else>
       <div class="dep-toolbar">
-        <label class="dep-picker">
-          <span class="adm-muted">Site</span>
-          <select :value="selectedSiteId" @change="selectSite(($event.target as HTMLSelectElement).value)">
-            <option v-for="s in sites" :key="s.id" :value="s.id">{{ s.slug }} · {{ s.archetype }}</option>
-          </select>
-        </label>
+        <span v-if="activeSite" class="dep-active">
+          <span class="dep-active__mark" aria-hidden="true">◇</span>
+          <span class="dep-active__name">{{ activeSite.slug }}</span>
+          <span class="dep-active__meta">{{ activeSite.archetype }}</span>
+        </span>
         <button
           type="button"
           class="adm-btn adm-btn--ghost adm-btn--sm"
-          :disabled="logsLoading || deployLoading"
+          :disabled="logsLoading || deployLoading || !selectedSiteId"
           @click="selectSite(selectedSiteId)"
         >Refresh</button>
       </div>
@@ -125,12 +128,18 @@ onMounted(async () => {
 
 <style scoped>
 .dep-toolbar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
-.dep-picker { display: inline-flex; align-items: center; gap: 0.5rem; }
-.dep-picker select {
-  background: var(--adm-surface-2); color: var(--adm-text);
-  border: 1px solid var(--adm-border-strong); border-radius: 6px;
-  padding: 0.35rem 0.6rem; font: inherit; font-size: 0.85rem;
+/* No site picker here — Deployments follows the site selected in the header. */
+.dep-active {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  padding: 0.35rem 0.7rem;
+  background: var(--adm-surface-2);
+  border: 1px solid var(--adm-border);
+  border-radius: 999px;
+  font-size: 0.85rem;
 }
+.dep-active__mark { color: var(--adm-accent); }
+.dep-active__name { font-weight: 600; }
+.dep-active__meta { color: var(--adm-text-muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
 .dep-summary { padding: 1rem 1.25rem; margin-bottom: 1rem; }
 .dep-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem 1.25rem; margin: 0; }
 .dep-grid dt { color: var(--adm-text-muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
