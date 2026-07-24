@@ -1,24 +1,33 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { RouterLink } from 'vue-router'
-import { ChevronDown, Settings, Copy, Check, Download, CornerDownRight, AlignLeft, AlignCenter, Palette, LayoutTemplate, LayoutGrid, Globe, Code2, User } from 'lucide-vue-next'
+import { RouterLink, useRoute } from 'vue-router'
+import { ChevronDown, Settings, Copy, Check, Download, CornerDownRight, AlignLeft, AlignCenter, Palette, SwatchBook, LayoutTemplate, LayoutGrid, Globe, Code2, User, Save, Loader2, AlertCircle, Trash2, Plus, Pencil, CornerRightDown, ImagePlus } from 'lucide-vue-next'
 import { useSiteTheme } from '../composables/useSiteTheme'
 import { useSectionFlash } from '../composables/useSectionFlash'
+import { useContentEditor } from '../composables/useContentEditor'
+import { usePreferences } from '../composables/usePreferences'
 import { useAdminAuthStore } from '../platform/adminAuthStore'
 import { useSiteContentStore } from '../platform/siteContentStore'
 import { THEME_LIST } from '../themes'
 import { SWATCH_LIST } from '../themes/swatches'
-import { SWATCH_GROUP_LABELS, type SwatchGroup } from '../themes/tokens'
+import { SWATCH_THEORIES } from '../themes/tokens'
+import type { ColorSwatch } from '../themes/tokens'
+import {
+  customSwatches, saveCustomSwatch, deleteCustomSwatch,
+  buildPalette, hexToHsl, slugifyPaletteName,
+  HARMONY_MODELS, type HarmonyModel,
+} from '../themes/customSwatches'
 
 const auth = useAdminAuthStore()
 const content = useSiteContentStore()
+const { state: prefs, setThemeAutosave } = usePreferences()
 
-// Group swatches by their `group` field so the picker renders sections
-// (Neutral / Earth / Warm / Bold / Dark / Neon) instead of one flat grid.
-const GROUP_ORDER: SwatchGroup[] = ['neutral', 'earth', 'warm', 'bold', 'dark', 'neon']
-const swatchGroups = computed(() => {
-  return GROUP_ORDER
-    .map(g => ({ group: g, label: SWATCH_GROUP_LABELS[g], items: SWATCH_LIST.filter(s => s.group === g) }))
+// The Color Lab groups swatches by color theory — each group carries its
+// harmony model + psychological register so choosing color is informed,
+// not decorative guesswork.
+const theoryGroups = computed(() => {
+  return SWATCH_THEORIES
+    .map(t => ({ ...t, items: SWATCH_LIST.filter(s => s.group === t.id) }))
     .filter(g => g.items.length > 0)
 })
 
@@ -35,7 +44,7 @@ const {
   setAlignment,
 } = useSiteTheme()
 
-const VARIANTS = ['essentials', 'portfolio'] as const
+const VARIANTS = ['essentials', 'portfolio', 'extended'] as const
 const HERO_STYLES = ['1', '2', '3', '4', '5', '6'] as const
 const HERO_STYLE_LABELS: Record<string, string> = { '1': 'Default', '2': 'Overlay', '3': 'Broadsheet', '4': 'Split', '5': 'Marquee', '6': 'Float' }
 const FOOTER_STYLES = ['1', '2', '3', '4', '5'] as const
@@ -55,15 +64,21 @@ const SITE_STYLES = ['1', '2', '3'] as const
 const SITE_STYLE_LABEL = 'Site style'
 const SITE_STYLE_LABELS: Record<string, string> = { '1': 'Default', '2': 'Alt', '3': 'Bold' }
 
-type Tab = 'theme' | 'style' | 'sections' | 'global' | 'config'
+type Tab = 'edit' | 'theme' | 'color' | 'style' | 'sections' | 'global' | 'config'
 const TAB_STORAGE_KEY = 'ap-switcher-tab'
 function readTab(): Tab {
   try {
     const v = localStorage.getItem(TAB_STORAGE_KEY)
-    if (v === 'theme' || v === 'style' || v === 'sections' || v === 'global' || v === 'config') return v
+    if (v === 'edit' || v === 'theme' || v === 'color' || v === 'style' || v === 'sections' || v === 'global' || v === 'config') return v
   } catch { /* storage unavailable */ }
   return 'theme'
 }
+
+// ── Live content editor (in-situ + generated form) ──
+const editor = useContentEditor()
+// Re-bind the in-situ elements after navigating to a new page while editing.
+const route = useRoute()
+watch(() => route.fullPath, () => editor.rescan())
 const tab = ref<Tab>(readTab())
 watch(tab, (v) => { try { localStorage.setItem(TAB_STORAGE_KEY, v) } catch { /* */ } })
 const open = ref(false)
@@ -91,7 +106,8 @@ function jumpTo(key: keyof typeof sectionTargets) {
 
 /* ── Config export (mirrors the original archetype-project switcher) ── */
 const copied = ref(false)
-const currentSwatch = computed(() => SWATCH_LIST.find(s => s.name === swatchName.value))
+const currentSwatch = computed(() =>
+  SWATCH_LIST.find(s => s.name === swatchName.value) ?? customSwatches.value.find(s => s.name === swatchName.value))
 const configSnippet = computed(() => JSON.stringify({
   theme: themeName.value,
   swatch: swatchName.value,
@@ -124,6 +140,49 @@ function downloadConfig() {
   a.download = `archetype-config-${themeName.value}-${swatchName.value}.json`
   a.click()
   URL.revokeObjectURL(url)
+}
+
+/* ── Palette builder (Color Lab) ──
+   Pick a hue, a harmony model, and a mode; the builder derives a complete
+   readable palette with the same rules the curated presets follow. Saved
+   palettes persist in localStorage and can be applied like any preset. */
+const builderOpen = ref(false)
+const builderHue = ref(Math.round(hexToHsl(currentSwatch.value?.primary ?? '#A96F3D').h))
+const builderHarmony = ref<HarmonyModel>('complementary')
+const builderMode = ref<'light' | 'dark'>('light')
+const builderName = ref('')
+
+const builderPalette = computed(() => buildPalette(builderHue.value, builderHarmony.value, builderMode.value))
+const builderPreviewOrder = computed(() => {
+  const p = builderPalette.value
+  return [
+    { key: 'surface', val: p.surface }, { key: 'surfaceAlt', val: p.surfaceAlt },
+    { key: 'primary', val: p.primary }, { key: 'accent', val: p.accent },
+    { key: 'ink', val: p.ink }, { key: 'line', val: p.line },
+  ]
+})
+
+function tryBuilderPalette() {
+  const draft = draftSwatch()
+  saveCustomSwatch(draft)
+  setSwatch(draft.name)
+}
+
+function draftSwatch(): ColorSwatch {
+  const label = builderName.value.trim() || `Hue ${builderHue.value}°`
+  return {
+    name: slugifyPaletteName(label),
+    label,
+    mode: builderMode.value,
+    group: builderMode.value === 'dark' ? 'dark' : 'bold',
+    feel: `${HARMONY_MODELS.find(m => m.id === builderHarmony.value)?.label} palette built at ${builderHue.value}°`,
+    ...builderPalette.value,
+  }
+}
+
+function removeCustom(name: string) {
+  if (swatchName.value === name) setSwatch('sand')
+  deleteCustomSwatch(name)
 }
 
 /* ── Single-source dimension animation ──
@@ -186,9 +245,12 @@ watch(open, (v) => {
 })
 
 /* ── Owner-driven publish ──
-   When a signed-in site owner tweaks any setting, debounce briefly and push
-   the new values to the backend so other visitors / incognito tabs render
-   the same theme. No-op for anonymous viewers — they only touch localStorage. */
+   When a signed-in site owner tweaks any setting we push the new values
+   to the backend so other visitors render the same theme. In autosave mode
+   we fire on the next tick (no debounce delay — settings appear instantly
+   for new visitors). With autosave off the owner has to hit Save and the
+   button surfaces a dirty/saving/saved/error state. Anonymous visitors
+   never hit the network — they stay localStorage-only. */
 const themeSnapshot = computed(() => ({
   theme: themeName.value,
   swatch: swatchName.value,
@@ -208,19 +270,51 @@ const themeSnapshot = computed(() => ({
   },
 }))
 
+const canPublish = computed(() => !!auth.owner && content.isPlatform)
+type SaveState = 'idle' | 'saving' | 'saved' | 'error'
+const saveState = ref<SaveState>('idle')
+const saveError = ref<string | null>(null)
+const dirty = ref(false)
 let publishTimer: number | null = null
+let savedResetTimer: number | null = null
 let publishedInitial = false
-watch(themeSnapshot, (snap) => {
+
+async function performSave() {
+  if (!canPublish.value) return
+  if (publishTimer) { clearTimeout(publishTimer); publishTimer = null }
+  saveState.value = 'saving'
+  saveError.value = null
+  try {
+    await content.saveThemePatch(themeSnapshot.value)
+    dirty.value = false
+    saveState.value = 'saved'
+    if (savedResetTimer) clearTimeout(savedResetTimer)
+    savedResetTimer = window.setTimeout(() => {
+      if (saveState.value === 'saved') saveState.value = 'idle'
+    }, 1800)
+  } catch (e) {
+    saveState.value = 'error'
+    saveError.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+watch(themeSnapshot, () => {
   // Skip the first emit so just mounting (or hydration syncing refs) doesn't
   // immediately push to the server.
   if (!publishedInitial) { publishedInitial = true; return }
-  if (!auth.owner || !content.isPlatform) return
+  if (!canPublish.value) return
+  dirty.value = true
+  if (!prefs.value.themeAutosave) return
+  // Autosave: coalesce only enough to merge synchronous bursts; effectively
+  // immediate from a human's perspective.
   if (publishTimer) clearTimeout(publishTimer)
-  publishTimer = window.setTimeout(() => {
-    publishTimer = null
-    content.saveThemePatch(snap).catch(() => { /* silent — falls back to local-only */ })
-  }, 800)
+  publishTimer = window.setTimeout(() => { publishTimer = null; performSave() }, 0)
 }, { deep: true })
+
+// When the owner flips autosave back on while dirty, save right away.
+watch(() => prefs.value.themeAutosave, (on) => {
+  if (on && dirty.value && canPublish.value) performSave()
+})
 </script>
 
 <template>
@@ -292,12 +386,129 @@ watch(themeSnapshot, (snap) => {
           </button>
         </div>
 
+        <!-- Save / autosave row. Only owners on platform builds see this; the
+             controls explicitly surface what the picker is doing with each
+             tweak (silent failures used to leave owners thinking everything
+             was saved when it wasn't). -->
+        <div v-if="canPublish" class="ap-switcher__save">
+          <button
+            type="button"
+            class="ap-switcher__save-btn"
+            :class="{
+              'is-saving': saveState === 'saving',
+              'is-saved': saveState === 'saved',
+              'is-error': saveState === 'error',
+              'is-dirty': dirty && saveState !== 'saving',
+            }"
+            :disabled="saveState === 'saving' || (!dirty && saveState === 'idle')"
+            :title="saveError || ''"
+            @click="performSave"
+          >
+            <Loader2 v-if="saveState === 'saving'" :size="14" class="ap-switcher__spin" />
+            <Check v-else-if="saveState === 'saved'" :size="14" />
+            <AlertCircle v-else-if="saveState === 'error'" :size="14" />
+            <Save v-else :size="14" />
+            <span>
+              {{ saveState === 'saving' ? 'Saving…'
+                 : saveState === 'saved' ? 'Saved'
+                 : saveState === 'error' ? 'Retry save'
+                 : dirty ? 'Save changes' : 'Saved' }}
+            </span>
+          </button>
+          <label class="ap-switcher__autosave" :title="prefs.themeAutosave ? 'Autosave on — changes publish instantly' : 'Autosave off — click Save to publish'">
+            <input
+              type="checkbox"
+              :checked="prefs.themeAutosave"
+              @change="setThemeAutosave(($event.target as HTMLInputElement).checked)"
+            />
+            <span>Autosave</span>
+          </label>
+        </div>
+        <p v-if="canPublish && saveState === 'error' && saveError" class="ap-switcher__save-err">
+          {{ saveError }}
+        </p>
+
         <div class="ap-switcher__tabs" role="tablist">
+          <button type="button" role="tab" class="ap-switcher__tab ap-switcher__tab--edit" :class="{ 'is-active': tab === 'edit' }" @click="tab = 'edit'"><Pencil :size="14" /><span>edit</span></button>
           <button type="button" role="tab" class="ap-switcher__tab" :class="{ 'is-active': tab === 'theme' }" @click="tab = 'theme'"><Palette :size="14" /><span>theme</span></button>
+          <button type="button" role="tab" class="ap-switcher__tab" :class="{ 'is-active': tab === 'color' }" @click="tab = 'color'"><SwatchBook :size="14" /><span>color</span></button>
           <button type="button" role="tab" class="ap-switcher__tab" :class="{ 'is-active': tab === 'style' }" @click="tab = 'style'"><LayoutTemplate :size="14" /><span>style</span></button>
           <button type="button" role="tab" class="ap-switcher__tab" :class="{ 'is-active': tab === 'sections' }" @click="tab = 'sections'"><LayoutGrid :size="14" /><span>sections</span></button>
           <button type="button" role="tab" class="ap-switcher__tab" :class="{ 'is-active': tab === 'global' }" @click="tab = 'global'"><Globe :size="14" /><span>global</span></button>
           <button type="button" role="tab" class="ap-switcher__tab" :class="{ 'is-active': tab === 'config' }" @click="tab = 'config'"><Code2 :size="14" /><span>config</span></button>
+        </div>
+
+        <!-- Edit content -->
+        <div v-show="tab === 'edit'" class="ap-switcher__panel">
+          <div class="ap-switcher__span">
+            <button
+              type="button"
+              class="ap-edit-toggle"
+              :class="{ 'is-on': editor.editMode.value }"
+              @click="editor.toggle()"
+            >
+              <span class="ap-edit-toggle__track"><span class="ap-edit-toggle__thumb" /></span>
+              <span class="ap-edit-toggle__label">
+                <strong>{{ editor.editMode.value ? 'Editing the page' : 'Edit content on the page' }}</strong>
+                <small>{{ editor.editMode.value ? 'Click any text to edit it, or use the fields below.' : 'Turn on to edit text directly on the page.' }}</small>
+              </span>
+            </button>
+
+            <template v-if="editor.editMode.value">
+              <div v-if="!editor.fields.value.length" class="ap-switcher__hint">No editable text found on this page yet.</div>
+
+              <div class="ap-edit-scroll">
+                <div v-for="grp in editor.groups.value" :key="grp.name" class="ap-edit-group">
+                  <p class="ap-edit-group__title">{{ grp.label }}</p>
+                  <div
+                    v-for="f in grp.items"
+                    :key="f.path"
+                    class="ap-edit-field"
+                    :class="{ 'is-active': editor.activePath.value === f.path }"
+                  >
+                    <button type="button" class="ap-edit-field__label" :title="`Scroll to ${f.label}`" @click="editor.focusField(f.path)">
+                      <CornerRightDown :size="12" /> {{ f.label }}
+                    </button>
+                    <button
+                      v-if="f.type === 'image'"
+                      type="button"
+                      class="ap-edit-imgbtn"
+                      :title="`Replace ${f.label}`"
+                      @click="editor.focusField(f.path); editor.replaceImage(f.path)"
+                    >
+                      <img :src="editor.getByPath(f.path)" alt="" class="ap-edit-imgbtn__thumb" />
+                      <span class="ap-edit-imgbtn__cta"><ImagePlus :size="13" /> Replace</span>
+                    </button>
+                    <textarea
+                      v-else-if="f.multiline"
+                      class="ap-edit-field__input"
+                      rows="2"
+                      :value="editor.getByPath(f.path)"
+                      @focus="editor.focusField(f.path)"
+                      @input="editor.setByPath(f.path, ($event.target as HTMLTextAreaElement).value)"
+                    />
+                    <input
+                      v-else
+                      class="ap-edit-field__input"
+                      :value="editor.getByPath(f.path)"
+                      @focus="editor.focusField(f.path)"
+                      @input="editor.setByPath(f.path, ($event.target as HTMLInputElement).value)"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="editor.canPersist.value" class="ap-edit-save">
+                <button type="button" class="ap-switcher__chip" :disabled="editor.saving.value || !editor.dirty.value.size" @click="editor.save(false)">Save draft</button>
+                <button type="button" class="ap-switcher__chip is-active" :disabled="editor.saving.value || !editor.dirty.value.size" @click="editor.save(true)">
+                  {{ editor.saving.value ? 'Saving…' : 'Publish' }}
+                </button>
+                <span v-if="editor.saveMsg.value" class="ap-edit-save__msg">{{ editor.saveMsg.value }}</span>
+                <span v-else-if="editor.dirty.value.size" class="ap-edit-save__msg">{{ editor.dirty.value.size }} change{{ editor.dirty.value.size === 1 ? '' : 's' }}</span>
+              </div>
+              <p v-else class="ap-switcher__hint">Sign in as the site owner to save your changes.</p>
+            </template>
+          </div>
         </div>
 
         <!-- Theme -->
@@ -315,26 +526,137 @@ watch(themeSnapshot, (snap) => {
             </div>
           </div>
           <div class="ap-switcher__span">
-            <p class="ap-eyebrow">Swatch</p>
-            <div class="ap-switcher__swatch-all">
-              <template v-for="grp in swatchGroups" :key="grp.group">
-                <span class="ap-switcher__group-label">{{ grp.label }}</span>
+            <p class="ap-eyebrow">Color</p>
+            <div class="ap-switcher__colors">
+              <button
+                v-for="s in SWATCH_LIST" :key="s.name" type="button"
+                class="ap-color" :class="{ 'is-active': swatchName === s.name }"
+                :title="s.label" :aria-label="s.label"
+                @click="setSwatch(s.name)"
+              >
+                <span class="ap-color__chip" aria-hidden="true">
+                  <span :style="{ background: s.primary }" />
+                  <span :style="{ background: s.accent }" />
+                </span>
+                <span class="ap-color__name">{{ s.label }}</span>
+              </button>
+            </div>
+            <button type="button" class="ap-switcher__studio-link" @click="tab = 'color'">
+              <SwatchBook :size="13" /> Fine-tune in the Color Studio
+            </button>
+          </div>
+        </div>
+
+        <!-- Color Lab -->
+        <div v-show="tab === 'color'" class="ap-switcher__panel">
+          <div class="ap-switcher__span">
+            <div v-for="grp in theoryGroups" :key="grp.id" class="ap-lab__theory">
+              <div class="ap-lab__theory-head">
+                <span class="ap-lab__theory-name">{{ grp.label }}</span>
+                <span class="ap-lab__theory-harmony">{{ grp.harmony }}</span>
+              </div>
+              <p class="ap-lab__theory-psy" :title="grp.psychology">{{ grp.psychology }}</p>
+              <div class="ap-lab__swatches">
                 <button
                   v-for="s in grp.items"
                   :key="s.name"
                   type="button"
-                  class="ap-switcher__swatch-card"
+                  class="ap-lab__swatch"
                   :class="{ 'is-active': swatchName === s.name }"
-                  :title="`${s.label} · ${grp.label}`"
+                  :style="{ background: s.surface, borderColor: swatchName === s.name ? s.primary : s.line }"
+                  :title="s.feel ? `${s.label} — ${s.feel}` : s.label"
                   @click="setSwatch(s.name)"
                 >
-                  <span class="ap-switcher__swatch-tile">
-                    <span class="ap-switcher__swatch-chip" :style="{ background: s.primary }" />
-                    <span class="ap-switcher__swatch-chip" :style="{ background: s.accent }" />
+                  <span class="ap-lab__swatch-dots">
+                    <span :style="{ background: s.primary }" />
+                    <span :style="{ background: s.accent }" />
                   </span>
-                  <span class="ap-switcher__swatch-name">{{ s.label }}</span>
+                  <span class="ap-lab__swatch-name" :style="{ color: s.ink }">{{ s.label }}</span>
+                  <Check v-if="swatchName === s.name" :size="12" class="ap-lab__swatch-check" :style="{ color: s.primary }" />
                 </button>
-              </template>
+              </div>
+            </div>
+
+            <!-- My palettes -->
+            <div class="ap-lab__theory ap-lab__theory--mine">
+              <div class="ap-lab__theory-head">
+                <span class="ap-lab__theory-name">My palettes</span>
+                <span class="ap-lab__theory-harmony">Built &amp; saved by you</span>
+              </div>
+              <div v-if="customSwatches.length" class="ap-lab__swatches">
+                <div
+                  v-for="s in customSwatches"
+                  :key="s.name"
+                  class="ap-lab__swatch ap-lab__swatch--custom"
+                  :class="{ 'is-active': swatchName === s.name }"
+                  :style="{ background: s.surface, borderColor: swatchName === s.name ? s.primary : s.line }"
+                >
+                  <button type="button" class="ap-lab__swatch-hit" :title="s.feel || s.label" @click="setSwatch(s.name)">
+                    <span class="ap-lab__swatch-dots">
+                      <span :style="{ background: s.primary }" />
+                      <span :style="{ background: s.accent }" />
+                    </span>
+                    <span class="ap-lab__swatch-name" :style="{ color: s.ink }">{{ s.label }}</span>
+                  </button>
+                  <button type="button" class="ap-lab__swatch-del" :style="{ color: s.inkMuted }" :aria-label="`Delete ${s.label}`" @click="removeCustom(s.name)">
+                    <Trash2 :size="12" />
+                  </button>
+                </div>
+              </div>
+              <p v-else class="ap-switcher__hint">No saved palettes yet — build one below.</p>
+
+              <button v-if="!builderOpen" type="button" class="ap-switcher__chip ap-switcher__chip--icon ap-lab__new" @click="builderOpen = true">
+                <Plus :size="14" /> New palette
+              </button>
+
+              <!-- Builder -->
+              <div v-if="builderOpen" class="ap-lab__builder">
+                <label class="ap-lab__hue">
+                  <span class="ap-lab__builder-label">Base hue · {{ builderHue }}°</span>
+                  <input type="range" min="0" max="359" v-model.number="builderHue" class="ap-lab__hue-slider" />
+                </label>
+                <div>
+                  <span class="ap-lab__builder-label">Harmony</span>
+                  <div class="ap-switcher__row">
+                    <button
+                      v-for="m in HARMONY_MODELS" :key="m.id" type="button"
+                      class="ap-switcher__chip"
+                      :class="{ 'is-active': builderHarmony === m.id }"
+                      :title="m.blurb"
+                      @click="builderHarmony = m.id"
+                    >{{ m.label }}</button>
+                  </div>
+                </div>
+                <div>
+                  <span class="ap-lab__builder-label">Mode</span>
+                  <div class="ap-switcher__row">
+                    <button type="button" class="ap-switcher__chip" :class="{ 'is-active': builderMode === 'light' }" @click="builderMode = 'light'">Light</button>
+                    <button type="button" class="ap-switcher__chip" :class="{ 'is-active': builderMode === 'dark' }" @click="builderMode = 'dark'">Dark</button>
+                  </div>
+                </div>
+                <div class="ap-lab__preview" :style="{ background: builderPalette.surface, borderColor: builderPalette.line }">
+                  <span
+                    v-for="c in builderPreviewOrder" :key="c.key"
+                    class="ap-lab__preview-chip"
+                    :style="{ background: c.val }"
+                    :title="`${c.key} · ${c.val}`"
+                  />
+                  <span class="ap-lab__preview-type" :style="{ color: builderPalette.ink }">Aa</span>
+                </div>
+                <div class="ap-lab__builder-row">
+                  <input
+                    v-model="builderName"
+                    type="text"
+                    class="ap-lab__name"
+                    placeholder="Palette name"
+                    @keydown.enter.prevent="tryBuilderPalette"
+                  />
+                  <button type="button" class="ap-switcher__chip ap-switcher__chip--icon is-active" @click="tryBuilderPalette">
+                    <Save :size="13" /> Save &amp; apply
+                  </button>
+                  <button type="button" class="ap-switcher__chip" @click="builderOpen = false">Close</button>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -666,6 +988,71 @@ watch(themeSnapshot, (snap) => {
    Pre-rotate so the icon visually invites "click to close". */
 .ap-switcher.is-open .ap-switcher__close { transform: rotate(0deg); }
 
+/* ── Save / autosave row ───────────────────────────────── */
+.ap-switcher__save {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.55rem 0.85rem 0.5rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--ap-line) 50%, transparent);
+}
+.ap-switcher__save-btn {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ap-line) 70%, transparent);
+  background: color-mix(in srgb, var(--ap-ink) 5%, transparent);
+  color: var(--ap-ink);
+  font: inherit; font-size: 0.72rem; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+.ap-switcher__save-btn:disabled { cursor: default; opacity: 0.55; }
+.ap-switcher__save-btn:not(:disabled):hover {
+  background: color-mix(in srgb, var(--ap-ink) 10%, transparent);
+}
+.ap-switcher__save-btn.is-dirty {
+  background: var(--ap-primary);
+  border-color: var(--ap-primary);
+  color: var(--ap-on-primary, var(--ap-surface));
+  opacity: 1;
+}
+.ap-switcher__save-btn.is-dirty:not(:disabled):hover {
+  background: color-mix(in srgb, var(--ap-primary) 88%, var(--ap-ink));
+}
+.ap-switcher__save-btn.is-saving { opacity: 0.85; }
+.ap-switcher__save-btn.is-saved {
+  background: color-mix(in srgb, var(--ap-primary) 18%, transparent);
+  border-color: color-mix(in srgb, var(--ap-primary) 45%, transparent);
+  color: var(--ap-primary);
+  opacity: 1;
+}
+.ap-switcher__save-btn.is-error {
+  background: rgba(220, 38, 38, 0.12);
+  border-color: rgba(220, 38, 38, 0.45);
+  color: rgb(185, 28, 28);
+  opacity: 1;
+}
+.ap-switcher__save-btn :deep(svg) { display: block; }
+.ap-switcher__spin { animation: ap-switcher-spin 0.9s linear infinite; }
+@keyframes ap-switcher-spin { to { transform: rotate(360deg); } }
+
+.ap-switcher__autosave {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  margin-left: auto;
+  font-size: 0.72rem; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--ap-ink-muted, var(--ap-ink));
+  cursor: pointer; user-select: none;
+}
+.ap-switcher__autosave input { accent-color: var(--ap-primary); cursor: pointer; }
+
+.ap-switcher__save-err {
+  margin: 0; padding: 0.4rem 0.85rem 0.55rem;
+  font-size: 0.72rem; color: rgb(185, 28, 28);
+  border-bottom: 1px solid color-mix(in srgb, var(--ap-line) 50%, transparent);
+  word-break: break-word;
+}
+
 /* ── Tabs ──────────────────────────────────────────────── */
 .ap-switcher__tabs {
   display: flex; gap: 0;
@@ -749,74 +1136,277 @@ watch(themeSnapshot, (snap) => {
 }
 .ap-switcher__swatch.is-active { outline: 2px solid; outline-offset: 2px; }
 
-/* ── Swatch cards (flat inline wrapping layout) ──
-   All groups and their swatches live in a single flex-wrap row.
-   Group labels are inline flex items acting as visual separators.
-   Each swatch card is a compact chip with two color dots + readable label. */
-.ap-switcher__swatch-all {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.4rem;
-  margin-top: 0.4rem;
+/* ── Color Lab ──────────────────────────────────────────
+   Theory groups render as titled clusters; each swatch is a tile painted
+   in its own SURFACE color (the background is the point), with primary +
+   accent dots and the palette name set in its own ink. */
+.ap-lab__theory { margin-bottom: 1rem; }
+.ap-lab__theory--mine {
+  margin-bottom: 0;
+  padding-top: 0.85rem;
+  border-top: 1px dashed color-mix(in srgb, var(--ap-line) 80%, transparent);
 }
-.ap-switcher__group-label {
-  margin: 0;
-  padding: 0.2rem 0.55rem;
-  font-size: 0.65rem;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: color-mix(in srgb, var(--ap-ink) 55%, transparent);
-  background: color-mix(in srgb, var(--ap-ink) 8%, transparent);
-  border-radius: 999px;
-  white-space: nowrap;
-  flex-shrink: 0;
+.ap-lab__theory-head {
+  display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap;
 }
-.ap-switcher__swatch-card {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.25rem;
-  padding: 0.35rem 0.55rem;
-  background: transparent;
-  border: 1px solid color-mix(in srgb, var(--ap-line) 75%, transparent);
-  border-radius: var(--ap-radius, 6px);
-  cursor: pointer;
-  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
-}
-.ap-switcher__swatch-card:hover {
-  border-color: color-mix(in srgb, var(--ap-primary) 55%, var(--ap-line));
-  transform: translateY(-1px);
-}
-.ap-switcher__swatch-card.is-active {
-  border-color: var(--ap-primary);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ap-primary) 28%, transparent);
-}
-.ap-switcher__swatch-tile {
-  display: flex;
-  gap: 3px;
-}
-.ap-switcher__swatch-chip {
-  display: block;
-  width: 16px; height: 16px;
-  border-radius: var(--ap-radius, 4px);
-  border: 1px solid color-mix(in srgb, var(--ap-ink) 12%, transparent);
-  flex-shrink: 0;
-}
-[data-theme='vibrant'] .ap-switcher__swatch-chip { border-radius: 50%; }
-.ap-switcher__swatch-name {
-  font-size: 0.67rem; font-weight: 500;
+.ap-lab__theory-name {
+  font-size: 0.72rem; font-weight: 700;
+  letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--ap-ink);
-  line-height: 1;
-  text-transform: lowercase;
-  white-space: nowrap;
 }
+.ap-lab__theory-harmony {
+  font-size: 0.68rem; color: var(--ap-ink-muted);
+  font-style: italic;
+}
+/* One-line mood summary — keeps the Color Studio compact (the multi-line
+   paragraph made each theory group far too tall). Full text on hover. */
+.ap-lab__theory-psy {
+  margin: 0.1rem 0 0.5rem;
+  font-size: 0.72rem; line-height: 1.4;
+  color: var(--ap-ink-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 100%;
+}
+.ap-lab__swatches {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+  gap: 0.4rem;
+}
+.ap-lab__swatch {
+  position: relative;
+  display: flex; align-items: center; gap: 0.45rem;
+  padding: 0.5rem 0.6rem;
+  border: 1.5px solid;
+  border-radius: var(--ap-radius, 8px);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+.ap-lab__swatch:hover { transform: translateY(-1px); box-shadow: 0 4px 14px -6px color-mix(in srgb, var(--ap-ink) 40%, transparent); }
+.ap-lab__swatch.is-active { box-shadow: 0 0 0 2px color-mix(in srgb, var(--ap-primary) 30%, transparent); }
+.ap-lab__swatch-dots { display: inline-flex; gap: 3px; flex-shrink: 0; }
+.ap-lab__swatch-dots span {
+  width: 13px; height: 13px; border-radius: 50%;
+  border: 1px solid rgba(0,0,0,0.12);
+  display: block;
+}
+.ap-lab__swatch-name {
+  font-size: 0.7rem; font-weight: 600;
+  line-height: 1.1;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ap-lab__swatch-check { margin-left: auto; flex-shrink: 0; }
+
+/* Custom palette tiles: apply zone + delete affordance */
+.ap-lab__swatch--custom { padding: 0; overflow: hidden; }
+.ap-lab__swatch-hit {
+  display: flex; align-items: center; gap: 0.45rem;
+  flex: 1; min-width: 0;
+  padding: 0.5rem 0.2rem 0.5rem 0.6rem;
+  background: transparent; border: 0; cursor: pointer; font: inherit;
+  text-align: left;
+}
+.ap-lab__swatch-del {
+  background: transparent; border: 0; cursor: pointer;
+  padding: 0.5rem 0.55rem;
+  display: inline-flex; align-items: center;
+  opacity: 0.55;
+  transition: opacity 140ms ease;
+}
+.ap-lab__swatch-del:hover { opacity: 1; }
+.ap-lab__new { margin-top: 0.6rem; }
+
+/* Builder */
+.ap-lab__builder {
+  margin-top: 0.75rem;
+  padding: 0.85rem;
+  border: 1px solid color-mix(in srgb, var(--ap-line) 80%, transparent);
+  border-radius: var(--ap-radius-lg, 12px);
+  display: grid; gap: 0.7rem;
+  background: color-mix(in srgb, var(--ap-ink) 3%, transparent);
+}
+.ap-lab__builder-label {
+  display: block;
+  font-size: 0.66rem; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--ap-ink-muted);
+  margin-bottom: 0.3rem;
+}
+.ap-lab__hue { display: block; }
+.ap-lab__hue-slider {
+  width: 100%;
+  height: 14px;
+  appearance: none; -webkit-appearance: none;
+  border-radius: 999px;
+  background: linear-gradient(90deg,
+    hsl(0, 75%, 55%), hsl(60, 75%, 55%), hsl(120, 75%, 45%),
+    hsl(180, 75%, 45%), hsl(240, 75%, 60%), hsl(300, 75%, 55%), hsl(359, 75%, 55%));
+  outline: none;
+  cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--ap-ink) 15%, transparent);
+}
+.ap-lab__hue-slider::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--ap-ink);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  cursor: grab;
+}
+.ap-lab__hue-slider::-moz-range-thumb {
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #fff; border: 2px solid var(--ap-ink);
+  cursor: grab;
+}
+.ap-lab__preview {
+  display: flex; align-items: center; gap: 0.4rem;
+  padding: 0.6rem 0.7rem;
+  border: 1.5px solid;
+  border-radius: var(--ap-radius, 8px);
+}
+.ap-lab__preview-chip {
+  width: 22px; height: 22px; border-radius: 6px;
+  border: 1px solid rgba(0,0,0,0.14);
+  display: block;
+}
+.ap-lab__preview-type {
+  margin-left: auto;
+  font-family: var(--ap-font-heading);
+  font-size: 1.05rem; font-weight: 700;
+}
+.ap-lab__builder-row { display: flex; gap: 0.45rem; align-items: center; flex-wrap: wrap; }
+.ap-lab__name {
+  flex: 1; min-width: 140px;
+  padding: 0.42rem 0.65rem;
+  border: 1px solid color-mix(in srgb, var(--ap-line) 85%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ap-surface) 80%, transparent);
+  color: var(--ap-ink);
+  font: inherit; font-size: 0.78rem;
+}
+.ap-lab__name:focus { outline: none; border-color: var(--ap-primary); }
 .ap-switcher__hint {
   margin: 0.25rem 0 0.6rem; font-size: 0.78rem;
   color: var(--ap-ink-muted);
 }
 .ap-switcher__span { grid-column: 1 / -1; }
+
+/* ── Edit-content tab ── */
+.ap-switcher__tab--edit.is-active :deep(svg),
+.ap-switcher__tab--edit:hover :deep(svg) { color: var(--ap-primary); }
+
+.ap-edit-toggle {
+  display: flex; align-items: center; gap: 0.75rem; width: 100%;
+  padding: 0.7rem 0.8rem; margin-bottom: 0.5rem;
+  background: var(--ap-surface-alt); color: var(--ap-ink);
+  border: 1px solid color-mix(in srgb, var(--ap-line) 80%, transparent);
+  border-radius: 12px; cursor: pointer; text-align: left;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+.ap-edit-toggle.is-on { border-color: var(--ap-primary); background: color-mix(in srgb, var(--ap-primary) 8%, var(--ap-surface-alt)); }
+.ap-edit-toggle__track {
+  width: 40px; height: 24px; flex-shrink: 0; border-radius: 999px;
+  background: color-mix(in srgb, var(--ap-ink) 20%, transparent);
+  position: relative; transition: background 180ms ease;
+}
+.ap-edit-toggle.is-on .ap-edit-toggle__track { background: var(--ap-primary); }
+.ap-edit-toggle__thumb {
+  position: absolute; top: 2px; left: 2px; width: 20px; height: 20px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.3, 1.2);
+}
+.ap-edit-toggle.is-on .ap-edit-toggle__thumb { transform: translateX(16px); }
+.ap-edit-toggle__label { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+.ap-edit-toggle__label strong { font-size: 0.86rem; }
+.ap-edit-toggle__label small { font-size: 0.72rem; color: var(--ap-ink-muted); line-height: 1.35; }
+
+.ap-edit-scroll { max-height: 44vh; overflow-y: auto; margin: 0 -0.2rem; padding: 0 0.2rem; }
+.ap-edit-group { margin-bottom: 0.85rem; }
+.ap-edit-group__title {
+  font-size: 0.66rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--ap-ink-muted); margin: 0.4rem 0 0.35rem;
+}
+.ap-edit-field { margin-bottom: 0.5rem; padding: 0.15rem; border-radius: 8px; }
+.ap-edit-field.is-active { background: color-mix(in srgb, var(--ap-primary) 10%, transparent); }
+.ap-edit-field__label {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  background: none; border: 0; padding: 0 0 0.2rem; cursor: pointer;
+  font-size: 0.68rem; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--ap-ink-muted);
+}
+.ap-edit-field__label:hover { color: var(--ap-primary); }
+.ap-edit-field__input {
+  width: 100%; padding: 0.4rem 0.55rem;
+  background: var(--ap-surface); color: var(--ap-ink);
+  border: 1px solid color-mix(in srgb, var(--ap-line) 85%, transparent);
+  border-radius: 8px; font: inherit; font-size: 0.82rem; line-height: 1.4;
+  resize: vertical;
+}
+.ap-edit-field__input:focus { outline: none; border-color: var(--ap-primary); }
+
+/* Image field: thumbnail + hover "Replace" overlay */
+.ap-edit-imgbtn {
+  position: relative; display: block; width: 100%; padding: 0; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--ap-line) 85%, transparent);
+  border-radius: 8px; overflow: hidden; background: var(--ap-surface-alt);
+  aspect-ratio: 16 / 9;
+}
+.ap-edit-imgbtn:hover { border-color: var(--ap-primary); }
+.ap-edit-imgbtn__thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ap-edit-imgbtn__cta {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 0.35rem;
+  background: rgba(0,0,0,0.42); color: #fff; font-size: 0.76rem; font-weight: 600;
+  opacity: 0; transition: opacity 140ms ease;
+}
+.ap-edit-imgbtn:hover .ap-edit-imgbtn__cta { opacity: 1; }
+
+.ap-edit-save {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  margin-top: 0.75rem; padding-top: 0.75rem;
+  border-top: 1px solid color-mix(in srgb, var(--ap-line) 60%, transparent);
+}
+.ap-edit-save__msg { font-size: 0.74rem; color: var(--ap-ink-muted); }
+
+/* ── Quick color toggles on the Theme tab — just colors, no descriptions ── */
+.ap-switcher__colors {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 0.35rem;
+  margin-top: 0.4rem;
+}
+.ap-color {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.3rem 0.45rem;
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--ap-line) 80%, transparent);
+  border-radius: 999px;
+  cursor: pointer; font: inherit;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.ap-color:hover { border-color: var(--ap-ink); }
+.ap-color.is-active {
+  border-color: var(--ap-ink);
+  background: color-mix(in srgb, var(--ap-ink) 8%, transparent);
+}
+.ap-color__chip {
+  display: inline-flex; flex-shrink: 0;
+  width: 22px; height: 22px; border-radius: 50%;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--ap-ink) 18%, transparent);
+}
+.ap-color__chip span { flex: 1; display: block; }
+.ap-color__name {
+  font-size: 0.74rem; color: var(--ap-ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ap-switcher__studio-link {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  margin-top: 0.6rem;
+  background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--ap-primary); font: inherit; font-size: 0.76rem; font-weight: 600;
+}
+.ap-switcher__studio-link:hover { text-decoration: underline; }
 
 /* Config tab: code preview */
 .ap-switcher__code {
